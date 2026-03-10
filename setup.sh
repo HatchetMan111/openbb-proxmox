@@ -429,12 +429,12 @@ msg_info "VM ${VMID} wird gestartet"
 qm start "$VMID"
 msg_ok "VM gestartet"
 
-# ─── Auf IP warten ────────────────────────────────────────
-msg_info "Warte auf VM-IP via QEMU Guest Agent (bis zu 3 Min)"
+# ─── Auf IP warten – 3 Methoden als Fallback ──────────────
+msg_info "Warte auf VM-Boot & IP-Adresse (bis zu 5 Min)"
 VM_IP=""
-for i in $(seq 1 36); do
-  sleep 5
-  VM_IP=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null | \
+
+get_ip_from_agent() {
+  qm guest cmd "$VMID" network-get-interfaces 2>/dev/null | \
     python3 -c "
 import sys, json
 try:
@@ -444,70 +444,153 @@ try:
             for addr in iface.get('ip-addresses', []):
                 if addr.get('ip-address-type') == 'ipv4':
                     ip = addr['ip-address']
-                    if not ip.startswith('127.'):
+                    if not ip.startswith('127.') and not ip.startswith('169.254.'):
+                        print(ip)
+                        raise SystemExit
+except: pass
+" 2>/dev/null || true
+}
+
+get_ip_from_arp() {
+  # ARP-Tabelle nach der VM-MAC abfragen
+  MAC=$(qm config "$VMID" 2>/dev/null | grep "net0" | grep -oP '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1 | tr '[:upper:]' '[:lower:]')
+  [[ -z "$MAC" ]] && return
+  arp -n 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1
+}
+
+get_ip_from_lease() {
+  # DHCP Lease-Dateien durchsuchen
+  for f in /var/lib/misc/dnsmasq.leases \
+            /var/lib/dhcp/dhcpd.leases \
+            /tmp/dnsmasq.leases; do
+    [[ -f "$f" ]] && grep -i "$HOSTNAME\|openbb" "$f" 2>/dev/null | \
+      grep -oP '\d+\.\d+\.\d+\.\d+' | grep -v "^0\." | head -1 && return
+  done
+}
+
+for i in $(seq 1 60); do
+  sleep 5
+  # Methode 1: QEMU Guest Agent
+  VM_IP=$(get_ip_from_agent)
+  [[ -n "$VM_IP" ]] && { msg_ok "IP via QEMU Agent: ${VM_IP}"; break; }
+  # Methode 2: ARP Tabelle
+  VM_IP=$(get_ip_from_arp)
+  [[ -n "$VM_IP" ]] && { msg_ok "IP via ARP: ${VM_IP}"; break; }
+  # Methode 3: DHCP Lease
+  VM_IP=$(get_ip_from_lease)
+  [[ -n "$VM_IP" ]] && { msg_ok "IP via DHCP Lease: ${VM_IP}"; break; }
+
+  ELAPSED=$(( i * 5 ))
+  printf "  ${YW}Warte auf Boot... ${ELAPSED}s / 300s  (VM bootet noch)${CL}\r"
+done
+echo ""
+
+# Wenn IP immer noch unbekannt → direkt aus Proxmox holen
+if [[ -z "$VM_IP" ]]; then
+  msg_warn "QEMU Agent antwortet nicht – versuche alternative IP-Erkennung"
+  sleep 10
+  # pvesh direkt abfragen
+  VM_IP=$(pvesh get /nodes/$(hostname)/qemu/${VMID}/agent/network-get-interfaces \
+    2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    result = data.get('result', [])
+    for iface in result:
+        if iface.get('name') not in ['lo']:
+            for addr in iface.get('ip-addresses', []):
+                if addr.get('ip-address-type') == 'ipv4':
+                    ip = addr['ip-address']
+                    if not ip.startswith('127.') and not ip.startswith('169.254.'):
                         print(ip)
                         raise SystemExit
 except: pass
 " 2>/dev/null || true)
-  [[ -n "$VM_IP" ]] && break
-  printf "  ${YW}Warte... %d/36 (alle 5s)${CL}\r" "$i"
-done
-echo ""
-
-if [[ -z "$VM_IP" ]]; then
-  VM_IP="UNBEKANNT – in Proxmox unter VM ${VMID} → Summary nachschauen"
-  msg_warn "IP konnte nicht automatisch ermittelt werden"
-else
-  msg_ok "VM IP: ${VM_IP}"
 fi
 
-# ─── Fertig! ──────────────────────────────────────────────
+# Letzter Fallback: User muss IP manuell eingeben
+if [[ -z "$VM_IP" ]]; then
+  msg_warn "IP konnte nicht automatisch ermittelt werden"
+  echo ""
+  echo -e " ${YW}Bitte IP manuell ermitteln:${CL}"
+  echo -e "   Proxmox Webinterface → VM ${VMID} → Summary → IP Address"
+  echo -e "   ODER in der VM Console: ${BL}ip a | grep 'inet '${CL}"
+  echo ""
+  read -rp "  IP-Adresse der VM eingeben (oder Enter zum Überspringen): " MANUAL_IP
+  [[ -n "$MANUAL_IP" ]] && VM_IP="$MANUAL_IP"
+fi
+
+[[ -z "$VM_IP" ]] && VM_IP="(Bitte in Proxmox VM ${VMID} → Summary nachschauen)"
+
+# ─── Live-Installationsstatus anzeigen ────────────────────
+if [[ "$VM_IP" != *"Bitte"* ]]; then
+  echo ""
+  echo -e "${BOLD} Warte auf SSH-Verbindung zur VM...${CL}"
+  SSH_READY=false
+  for i in $(seq 1 24); do
+    sleep 5
+    if ssh -o StrictHostKeyChecking=no \
+           -o ConnectTimeout=3 \
+           -o PasswordAuthentication=no \
+           -o BatchMode=yes \
+           "openbb@${VM_IP}" true 2>/dev/null; then
+      SSH_READY=true
+      break
+    fi
+    printf "  ${YW}SSH noch nicht bereit... ${i}/24${CL}\r"
+  done
+  echo ""
+  [[ "$SSH_READY" == true ]] && msg_ok "SSH erreichbar!" || \
+    msg_warn "SSH noch nicht bereit – VM bootet noch. Bitte manuell verbinden."
+fi
+
+# ─── Abschluss-Dialog ─────────────────────────────────────
 whiptail --backtitle "OpenBB Proxmox Installer v2.0" \
-  --title "✅ VM erstellt – Installation läuft!" \
+  --title "✅ VM erstellt – OpenBB wird installiert!" \
   --msgbox \
-"Die VM wurde erfolgreich erstellt und gestartet!
+"VM ${VMID} läuft! OpenBB wird im Hintergrund installiert.
 
-VM Details:
-  ID:       ${VMID}
-  Name:     ${HOSTNAME}
-  IP:       ${VM_IP}
-  User:     openbb
-  RAM:      ${RAM} MB | CPU: ${CORES} Kerne | Disk: ${DISK}GB
+╔═══════════════════════════════════════════╗
+║  VM-IP:   ${VM_IP}
+║  User:    openbb
+║  Passwort: (dein gewähltes Passwort)
+╚═══════════════════════════════════════════╝
 
-OpenBB wird jetzt automatisch im Hintergrund
-installiert (Docker, JupyterLab, etc.)
-→ Dauer: ca. 5-8 Minuten nach VM-Start
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SSH LOGIN (sofort verfügbar):
+SSH LOGIN (jetzt möglich):
   ssh openbb@${VM_IP}
-  Passwort: (dein gewähltes Passwort)
 
-NACH der Installation erreichbar unter:
+INSTALLATION VERFOLGEN:
+  sudo tail -f /var/log/openbb-install.log
+
+Warte auf 'OpenBB Installation FERTIG!' im Log.
+Dann sind diese URLs aktiv (~8-10 Min):
+
   JupyterLab:  http://${VM_IP}:8888
                Token: openbb_local
   OpenBB API:  http://${VM_IP}:6900/api/v1/docs
   Portainer:   http://${VM_IP}:9000
 
-INSTALLATION VERFOLGEN (per SSH):
-  tail -f /var/log/openbb-install.log
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" 30 65
+TIPP: Installation fertig wenn diese Datei
+existiert: /var/log/openbb-install-done" 28 60
 
-# ─── Terminal-Ausgabe ─────────────────────────────────────
+# ─── Terminal Abschluss ───────────────────────────────────
 echo ""
 echo -e "${GN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
-echo -e "${GN}${BOLD} ✔  OpenBB VM ${VMID} läuft! Installation startet...${CL}"
+echo -e "${GN}${BOLD} ✔  OpenBB VM ${VMID} erstellt!${CL}"
 echo -e "${GN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CL}"
 echo ""
-echo -e " ${BOLD}SSH Login (sofort):${CL}"
-echo -e "   ${BL}ssh openbb@${VM_IP}${CL}"
-echo -e "   Passwort: dein gewähltes Passwort"
+echo -e " ${BOLD}VM IP:${CL}  ${GN}${VM_IP}${CL}"
 echo ""
-echo -e " ${BOLD}Installationslog verfolgen:${CL}"
-echo -e "   ${BL}ssh openbb@${VM_IP} 'sudo tail -f /var/log/openbb-install.log'${CL}"
+echo -e " ${BOLD}1. SSH Login:${CL}"
+echo -e "    ${BL}ssh openbb@${VM_IP}${CL}  (Passwort: dein gewähltes)"
 echo ""
-echo -e " ${BOLD}Nach ~8 Minuten verfügbar:${CL}"
-echo -e "   ${YW}JupyterLab:${CL}  http://${VM_IP}:8888  (Token: openbb_local)"
-echo -e "   ${YW}OpenBB API:${CL}  http://${VM_IP}:6900/api/v1/docs"
-echo -e "   ${YW}Portainer:${CL}   http://${VM_IP}:9000"
+echo -e " ${BOLD}2. Installation verfolgen:${CL}"
+echo -e "    ${BL}sudo tail -f /var/log/openbb-install.log${CL}"
+echo ""
+echo -e " ${BOLD}3. Nach ~10 Min – Interfaces öffnen:${CL}"
+echo -e "    ${YW}JupyterLab:${CL}  http://${VM_IP}:8888  (Token: openbb_local)"
+echo -e "    ${YW}OpenBB API:${CL}  http://${VM_IP}:6900/api/v1/docs"
+echo -e "    ${YW}Portainer:${CL}   http://${VM_IP}:9000"
+echo ""
+echo -e " ${INFO} Installation fertig wenn Log endet mit: ${GN}✅ OpenBB Installation FERTIG!${CL}"
 echo ""
