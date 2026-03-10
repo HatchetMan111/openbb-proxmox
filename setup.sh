@@ -9,7 +9,7 @@
 #    ✔ Robuste Fehlerbehandlung
 # ============================================================
 
-set -euo pipefail
+set -uo pipefail
 
 # ─── Farben ───────────────────────────────────────────────
 YW='\033[33m'; GN='\033[1;92m'; RD='\033[01;31m'
@@ -429,120 +429,75 @@ msg_info "VM ${VMID} wird gestartet"
 qm start "$VMID"
 msg_ok "VM gestartet"
 
-# ─── Auf IP warten – 3 Methoden als Fallback ──────────────
+# ─── Auf IP warten – robust, bricht nie vorzeitig ab ──────
 msg_info "Warte auf VM-Boot & IP-Adresse (bis zu 5 Min)"
 VM_IP=""
+NODE=$(hostname)
 
-get_ip_from_agent() {
-  qm guest cmd "$VMID" network-get-interfaces 2>/dev/null | \
-    python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    for iface in data:
-        if iface.get('name') not in ['lo']:
-            for addr in iface.get('ip-addresses', []):
-                if addr.get('ip-address-type') == 'ipv4':
-                    ip = addr['ip-address']
-                    if not ip.startswith('127.') and not ip.startswith('169.254.'):
-                        print(ip)
-                        raise SystemExit
-except: pass
-" 2>/dev/null || true
-}
-
-get_ip_from_arp() {
-  # ARP-Tabelle nach der VM-MAC abfragen
-  MAC=$(qm config "$VMID" 2>/dev/null | grep "net0" | grep -oP '([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}' | head -1 | tr '[:upper:]' '[:lower:]')
-  [[ -z "$MAC" ]] && return
-  arp -n 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1
-}
-
-get_ip_from_lease() {
-  # DHCP Lease-Dateien durchsuchen
-  for f in /var/lib/misc/dnsmasq.leases \
-            /var/lib/dhcp/dhcpd.leases \
-            /tmp/dnsmasq.leases; do
-    [[ -f "$f" ]] && grep -i "$HOSTNAME\|openbb" "$f" 2>/dev/null | \
-      grep -oP '\d+\.\d+\.\d+\.\d+' | grep -v "^0\." | head -1 && return
-  done
-}
-
+echo ""
 for i in $(seq 1 60); do
   sleep 5
-  # Methode 1: QEMU Guest Agent
-  VM_IP=$(get_ip_from_agent)
-  [[ -n "$VM_IP" ]] && { msg_ok "IP via QEMU Agent: ${VM_IP}"; break; }
-  # Methode 2: ARP Tabelle
-  VM_IP=$(get_ip_from_arp)
-  [[ -n "$VM_IP" ]] && { msg_ok "IP via ARP: ${VM_IP}"; break; }
-  # Methode 3: DHCP Lease
-  VM_IP=$(get_ip_from_lease)
-  [[ -n "$VM_IP" ]] && { msg_ok "IP via DHCP Lease: ${VM_IP}"; break; }
-
   ELAPSED=$(( i * 5 ))
-  printf "  ${YW}Warte auf Boot... ${ELAPSED}s / 300s  (VM bootet noch)${CL}\r"
-done
-echo ""
 
-# Wenn IP immer noch unbekannt → direkt aus Proxmox holen
-if [[ -z "$VM_IP" ]]; then
-  msg_warn "QEMU Agent antwortet nicht – versuche alternative IP-Erkennung"
-  sleep 10
-  # pvesh direkt abfragen
-  VM_IP=$(pvesh get /nodes/$(hostname)/qemu/${VMID}/agent/network-get-interfaces \
-    2>/dev/null | python3 -c "
-import sys, json
+  # Methode 1: QEMU Guest Agent via qm
+  TMP=$(qm guest cmd "$VMID" network-get-interfaces 2>/dev/null || true)
+  if [[ -n "$TMP" ]]; then
+    TMP_IP=$(echo "$TMP" | python3 -c "
+import sys,json
 try:
-    data = json.load(sys.stdin)
-    result = data.get('result', [])
-    for iface in result:
-        if iface.get('name') not in ['lo']:
-            for addr in iface.get('ip-addresses', []):
-                if addr.get('ip-address-type') == 'ipv4':
-                    ip = addr['ip-address']
-                    if not ip.startswith('127.') and not ip.startswith('169.254.'):
-                        print(ip)
-                        raise SystemExit
+  data=json.load(sys.stdin)
+  for iface in data:
+    if iface.get('name','') == 'lo': continue
+    for addr in iface.get('ip-addresses',[]):
+      ip=addr.get('ip-address','')
+      if addr.get('ip-address-type')=='ipv4' and not ip.startswith('127.') and not ip.startswith('169.254.'):
+        print(ip); raise SystemExit
 except: pass
 " 2>/dev/null || true)
-fi
+    if [[ -n "$TMP_IP" ]]; then VM_IP="$TMP_IP"; break; fi
+  fi
 
-# Letzter Fallback: User muss IP manuell eingeben
+  # Methode 2: pvesh API
+  TMP=$(pvesh get /nodes/${NODE}/qemu/${VMID}/agent/network-get-interfaces 2>/dev/null || true)
+  if [[ -n "$TMP" ]]; then
+    TMP_IP=$(echo "$TMP" | python3 -c "
+import sys,json
+try:
+  data=json.load(sys.stdin)
+  ifaces=data.get('result', data) if isinstance(data,dict) else data
+  for iface in ifaces:
+    if iface.get('name','') == 'lo': continue
+    for addr in iface.get('ip-addresses',[]):
+      ip=addr.get('ip-address','')
+      if addr.get('ip-address-type')=='ipv4' and not ip.startswith('127.') and not ip.startswith('169.254.'):
+        print(ip); raise SystemExit
+except: pass
+" 2>/dev/null || true)
+    if [[ -n "$TMP_IP" ]]; then VM_IP="$TMP_IP"; break; fi
+  fi
+
+  # Methode 3: ARP nach VM-MAC
+  MAC=$(qm config "$VMID" 2>/dev/null | grep -oP 'virtio=\K[0-9A-Fa-f:]{17}' | head -1 | tr '[:upper:]' '[:lower:]' || true)
+  if [[ -n "$MAC" ]]; then
+    TMP_IP=$(arp -n 2>/dev/null | grep -i "$MAC" | awk '{print $1}' | head -1 || true)
+    if [[ -n "$TMP_IP" ]]; then VM_IP="$TMP_IP"; break; fi
+  fi
+
+  printf "  \e[33m⏳ %ds – VM bootet, warte auf QEMU Agent...\e[0m\r" "$ELAPSED"
+done
+echo -e "\e[0m"
+
+# Fallback: manuell eingeben
 if [[ -z "$VM_IP" ]]; then
-  msg_warn "IP konnte nicht automatisch ermittelt werden"
   echo ""
-  echo -e " ${YW}Bitte IP manuell ermitteln:${CL}"
-  echo -e "   Proxmox Webinterface → VM ${VMID} → Summary → IP Address"
-  echo -e "   ODER in der VM Console: ${BL}ip a | grep 'inet '${CL}"
+  echo -e " \e[33m⚠  IP konnte nicht automatisch ermittelt werden.\e[0m"
+  echo -e " \e[36m→  Proxmox Webinterface → VM ${VMID} → Summary → IP Address\e[0m"
+  echo -e " \e[36m→  ODER in der Proxmox Console der VM: ip a\e[0m"
   echo ""
-  read -rp "  IP-Adresse der VM eingeben (oder Enter zum Überspringen): " MANUAL_IP
-  [[ -n "$MANUAL_IP" ]] && VM_IP="$MANUAL_IP"
+  read -rp "  ✏  IP der VM manuell eingeben: " VM_IP
+  [[ -z "$VM_IP" ]] && VM_IP="UNBEKANNT"
 fi
-
-[[ -z "$VM_IP" ]] && VM_IP="(Bitte in Proxmox VM ${VMID} → Summary nachschauen)"
-
-# ─── Live-Installationsstatus anzeigen ────────────────────
-if [[ "$VM_IP" != *"Bitte"* ]]; then
-  echo ""
-  echo -e "${BOLD} Warte auf SSH-Verbindung zur VM...${CL}"
-  SSH_READY=false
-  for i in $(seq 1 24); do
-    sleep 5
-    if ssh -o StrictHostKeyChecking=no \
-           -o ConnectTimeout=3 \
-           -o PasswordAuthentication=no \
-           -o BatchMode=yes \
-           "openbb@${VM_IP}" true 2>/dev/null; then
-      SSH_READY=true
-      break
-    fi
-    printf "  ${YW}SSH noch nicht bereit... ${i}/24${CL}\r"
-  done
-  echo ""
-  [[ "$SSH_READY" == true ]] && msg_ok "SSH erreichbar!" || \
-    msg_warn "SSH noch nicht bereit – VM bootet noch. Bitte manuell verbinden."
-fi
+msg_ok "VM IP: ${VM_IP}"
 
 # ─── Abschluss-Dialog ─────────────────────────────────────
 whiptail --backtitle "OpenBB Proxmox Installer v2.0" \
