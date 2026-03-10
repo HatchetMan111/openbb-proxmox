@@ -7,7 +7,7 @@ Bloomberg-Alternative für dein Homelab. Ein Befehl, fertig.
 ## 🚀 Installation (1 Befehl in der Proxmox Shell)
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/DEIN_GITHUB/openbb-proxmox/main/setup.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-proxmox/main/setup.sh)"
 ```
 
 > Diesen Befehl in der **Proxmox Shell** eingeben (nicht SSH zur VM!).
