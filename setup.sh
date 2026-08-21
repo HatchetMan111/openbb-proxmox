@@ -23,6 +23,7 @@ msg_warn()  { echo -e " ${YW}⚠  ${1}${CL}"; }
 
 cleanup() {
   [[ -n "${SSH_KEY_PATH:-}" ]] && rm -f "$SSH_KEY_PATH" "${SSH_KEY_PATH}.pub"
+  [[ -n "${SSH_KEYS_FILE:-}" ]] && rm -f "$SSH_KEYS_FILE"
   [[ -n "${REMOTE_SH_FILE:-}" ]] && rm -f "$REMOTE_SH_FILE"
 }
 trap cleanup EXIT
@@ -34,7 +35,7 @@ command -v pvesh &>/dev/null || msg_error "Muss auf dem Proxmox HOST ausgeführt
 # ─── Abhängigkeiten prüfen ────────────────────────────────
 msg_info "Prüfe Abhängigkeiten"
 apt-get update -qq >/dev/null 2>&1 || true
-for pkg in libguestfs-tools wget curl openssh-client python3; do
+for pkg in libguestfs-tools wget curl openssh-client python3 sshpass; do
   if ! dpkg -s "$pkg" &>/dev/null; then
     msg_info "$pkg wird installiert"
     apt-get install -y -qq "$pkg" >/dev/null 2>&1 || msg_error "Installation von $pkg fehlgeschlagen!"
@@ -152,10 +153,15 @@ msg_ok "Konfiguration: VM${VMID} | ${CORES}CPU | ${RAM}MB | ${DISK}GB | ${STORAG
 
 # ─── SSH-Key generieren (für automatisches Login nach Boot) ─
 SSH_KEY_PATH="/tmp/openbb_installer_key_${VMID}"
-rm -f "$SSH_KEY_PATH" "${SSH_KEY_PATH}.pub"
+SSH_KEYS_FILE="/tmp/openbb_cloudinit_keys_${VMID}"
+rm -f "$SSH_KEY_PATH" "${SSH_KEY_PATH}.pub" "$SSH_KEYS_FILE"
 ssh-keygen -t ed25519 -f "$SSH_KEY_PATH" -N "" -q
 chmod 600 "$SSH_KEY_PATH"
 SSH_PUB_KEY=$(cat "${SSH_KEY_PATH}.pub")
+# Key-Datei für Cloud-Init (injiziert den Key zuverlässig beim Boot,
+# unabhängig davon ob virt-customize erfolgreich war)
+echo "$SSH_PUB_KEY" > "$SSH_KEYS_FILE"
+chmod 644 "$SSH_KEYS_FILE"
 msg_ok "SSH-Key generiert"
 
 # ─── Ubuntu Cloud Image herunterladen (mit SHA256-Prüfung) ──
@@ -188,10 +194,11 @@ msg_ok "Image bereit (SHA256 geprüft)"
 #  - User 'openbb' per Passwort + Key erreichbar
 #  - NOPASSWD-Sudo NUR für die Automatik-Installation,
 #    wird vom Install-Script am Ende wieder entfernt
-msg_info "Image wird angepasst (SSH, qemu-agent, Pakete)"
-
 # sshd-Config lokal erzeugen und per --upload ins Image bringen
 # (--write verarbeitet \n nicht zuverlässig als Newline)
+# WICHTIG: Präfix "00-" – sshd liest sshd_config.d lexikografisch und der
+# ERSTE Treffer gewinnt. "00-" schlägt damit 50-cloud-init.conf
+# ("PasswordAuthentication no") und 60-cloudimg-settings.conf!
 SSHD_CONF_FILE="/tmp/openbb-sshd-${VMID}.conf"
 cat > "$SSHD_CONF_FILE" << 'SSHD'
 PasswordAuthentication yes
@@ -199,7 +206,10 @@ PubkeyAuthentication yes
 PermitRootLogin prohibit-password
 SSHD
 
-virt-customize -a "$IMG_WORK" \
+VIRT_LOG="/tmp/openbb-virt-customize-${VMID}.log"
+msg_info "Image wird angepasst (SSH, qemu-agent, Pakete) – dauert 1-3 Min"
+
+if virt-customize -a "$IMG_WORK" \
   --root-password "password:${PASS}" \
   --run-command "useradd -m -s /bin/bash -G sudo openbb || true" \
   --run-command "echo 'openbb:${PASS}' | chpasswd" \
@@ -215,17 +225,22 @@ virt-customize -a "$IMG_WORK" \
   --install "qemu-guest-agent,curl,wget,git,openssh-server" \
   --run-command "systemctl enable qemu-guest-agent" \
   --run-command "systemctl enable ssh" \
-  --upload "$SSHD_CONF_FILE:/etc/ssh/sshd_config.d/99-openbb.conf" \
+  --upload "$SSHD_CONF_FILE:/etc/ssh/sshd_config.d/00-openbb.conf" \
   --run-command "sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config" \
-  --run-command "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config || true" \
-  --run-command "sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true" \
+  --run-command "sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config || true" \
+  --run-command "test ! -f /etc/ssh/sshd_config.d/50-cloud-init.conf || sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/50-cloud-init.conf" \
+  --run-command "test ! -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf || sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/60-cloudimg-settings.conf" \
   --timezone "Europe/Berlin" \
   --quiet \
-  2>&1 | grep -v "^$" | grep -v "^\[" || true
+  > "$VIRT_LOG" 2>&1; then
+  msg_ok "Image angepasst (SSH + qemu-agent + User eingerichtet)"
+else
+  msg_warn "virt-customize hatte Fehler – Details in $VIRT_LOG"
+  echo -e "  ${YW}Cloud-Init injiziert User+SSH-Key trotzdem beim Boot.${CL}"
+fi
 rm -f "$SSHD_CONF_FILE"
 
 [[ ! -s "$IMG_WORK" ]] && msg_error "Image-Anpassung fehlgeschlagen!"
-msg_ok "Image angepasst (SSH + qemu-agent + User eingerichtet)"
 
 # ─── Alte VM entfernen falls vorhanden ────────────────────
 if qm status "$VMID" &>/dev/null; then
@@ -267,13 +282,13 @@ qm set "$VMID" --ide2 "${STORAGE}:cloudinit" 2>/dev/null \
 qm set "$VMID" \
   --ciuser "openbb" \
   --cipassword "${PASS}" \
+  --sshkeys "$SSH_KEYS_FILE" \
   --ipconfig0 "ip=dhcp" 2>/dev/null
+msg_ok "Cloud-Init konfiguriert (User + SSH-Key via Cloud-Init)"
 
 # Disk vergrößern
 qm resize "$VMID" scsi0 "${DISK}G" 2>/dev/null || true
 msg_ok "Disk konfiguriert (${DISK}GB)"
-
-unset PASS PASS2
 
 # ─── VM starten ───────────────────────────────────────────
 msg_info "VM wird gestartet"
@@ -356,15 +371,67 @@ SSH_OPTS=(-i "$SSH_KEY_PATH"
   -o BatchMode=yes
   -o LogLevel=ERROR)
 
+# Hilfsfunktion: Port-Check (unterscheidet "VM bootet noch" vs "Auth-Fehler")
+port_open() { timeout 3 bash -c "</dev/tcp/${VM_IP}/22" 2>/dev/null; }
+
+SSHPASS_MODE=false
+ssh_cmd() {
+  if [[ "$SSHPASS_MODE" == "true" ]]; then
+    SSHPASS="$PASS" sshpass -e ssh \
+      -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+      -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 -o LogLevel=ERROR "$@"
+  else
+    ssh "${SSH_OPTS[@]}" "$@"
+  fi
+}
+
+scp_cmd() {
+  if [[ "$SSHPASS_MODE" == "true" ]]; then
+    SSHPASS="$PASS" sshpass -e scp \
+      -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+      -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+      -o NumberOfPasswordPrompts=1 -o LogLevel=ERROR "$@"
+  else
+    scp "${SSH_OPTS[@]}" "$@"
+  fi
+}
+
+ssh_check() {
+  ssh "${SSH_OPTS[@]}" "openbb@${VM_IP}" "echo ok" 2>/dev/null | grep -q "ok"
+}
+
 SSH_OK=false
-for i in $(seq 1 24); do
-  if ssh "${SSH_OPTS[@]}" "openbb@${VM_IP}" "echo ok" 2>/dev/null | grep -q "ok"; then
+LAST_STATE=""
+for i in $(seq 1 30); do
+  if ssh_check; then
     SSH_OK=true
     break
   fi
-  printf "  ${YW}SSH noch nicht bereit... %ds${CL}\r" "$((i*5))"
-  sleep 5
+  if port_open; then
+    LAST_STATE="Port 22 offen – warte auf Authentifizierung (Cloud-Init)"
+  else
+    LAST_STATE="Port 22 zu – VM bootet noch / Cloud-Init läuft"
+  fi
+  printf "  ${YW}⏳ %3ds – %s${CL}\033[K\r" "$((i*10))" "$LAST_STATE"
+  sleep 10
 done
+echo ""
+
+# Fallback: Key-Login fehlgeschlagen, aber Port offen → Passwort-Login versuchen
+if [[ "$SSH_OK" != "true" ]] && port_open; then
+  msg_warn "Key-Login fehlgeschlagen – versuche Passwort-Login"
+  if SSHPASS="$PASS" sshpass -e \
+       ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+           -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+           -o NumberOfPasswordPrompts=1 -o LogLevel=ERROR \
+       "openbb@${VM_IP}" "echo ok" 2>/dev/null | grep -q "ok"; then
+    SSH_OK=true
+    SSHPASS_MODE=true
+    msg_ok "Passwort-Login erfolgreich!"
+  fi
+fi
+
 echo ""
 
 if [[ "$SSH_OK" == "true" ]]; then
@@ -385,16 +452,20 @@ echo "========================================"
 rm -f /var/log/openbb-install-done
 
 # SSH Passwort-Login sicherstellen (cloud-init kann es zurücksetzen)
+# "00-" Präfix: sshd liest sshd_config.d lexikografisch, erster Treffer gewinnt
 echo "[1/7] SSH Konfiguration..."
 mkdir -p /etc/ssh/sshd_config.d
-grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config.d/99-openbb.conf 2>/dev/null \
-  || echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/99-openbb.conf
-grep -q "^PermitRootLogin" /etc/ssh/sshd_config.d/99-openbb.conf 2>/dev/null \
-  || echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config.d/99-openbb.conf
-sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' \
+cat > /etc/ssh/sshd_config.d/00-openbb.conf << 'SSHD2'
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+SSHD2
+sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/g' \
   /etc/ssh/sshd_config 2>/dev/null || true
-sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' \
-  /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
+for f in /etc/ssh/sshd_config.d/*.conf; do
+  [[ "$f" == */00-openbb.conf ]] && continue
+  sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' "$f" 2>/dev/null || true
+done
 systemctl restart ssh
 echo "  → SSH OK"
 
@@ -578,6 +649,7 @@ NB
 # Sicherheit: Temporäres NOPASSWD-Sudo wieder entfernen
 # (User kann weiterhin sudo nutzen – dann aber mit Passwort)
 rm -f /etc/sudoers.d/openbb
+sed -i '/^openbb /d;/\bopenbb\b/d' /etc/sudoers.d/90-cloud-init-users 2>/dev/null || true
 
 touch /var/log/openbb-install-done
 
@@ -589,19 +661,36 @@ echo " JupyterLab Token: ${JUPYTER_TOKEN}"
 echo "========================================"
 INSTALL_EOF
 
-  # Script auf VM übertragen
-  scp "${SSH_OPTS[@]}" "$REMOTE_SH_FILE" "openbb@${VM_IP}:/tmp/openbb-install.sh" 2>/dev/null
+  # Script übertragen und im Hintergrund starten
+  scp_cmd "$REMOTE_SH_FILE" "openbb@${VM_IP}:/tmp/openbb-install.sh" 2>/dev/null
 
-  # Script im Hintergrund starten (sudo NOPASSWD ist nur dafür aktiv)
-  ssh "${SSH_OPTS[@]}" "openbb@${VM_IP}" \
-    "chmod +x /tmp/openbb-install.sh && sudo nohup /tmp/openbb-install.sh > /var/log/openbb-install.log 2>&1 & disown" \
+  # sudo-Aufruf: mit NOPASSWD via 'sudo -n', sonst Passwort via 'sudo -S'
+  if [[ "$SSHPASS_MODE" == "true" ]]; then
+    SUDO_RUN="echo '${PASS}' | sudo -S -p ''"
+  else
+    SUDO_RUN="sudo -n"
+  fi
+
+  ssh_cmd "openbb@${VM_IP}" \
+    "chmod +x /tmp/openbb-install.sh && ${SUDO_RUN} nohup /tmp/openbb-install.sh > /var/log/openbb-install.log 2>&1 < /dev/null & disown" \
     2>/dev/null
 
   INSTALL_STARTED=true
   msg_ok "OpenBB Installation gestartet!"
 else
   msg_warn "SSH Verbindung fehlgeschlagen – manuelle Installation nötig"
-  echo -e "  ${BL}In der VM Console einloggen (User: openbb) und ausführen:${CL}"
+  echo ""
+  echo -e "  ${BL}Diagnose:${CL}"
+  if port_open; then
+    echo -e "  ${YW}• Port 22 ist offen, aber Login schlägt fehl (Auth-Probleme)${CL}"
+    echo -e "  ${BL}→ In der Proxmox VM-Console einloggen (User: openbb) und prüfen:${CL}"
+    echo -e "  ${YW}sudo cat /home/openbb/.ssh/authorized_keys${CL}"
+  else
+    echo -e "  ${YW}• Port 22 nicht erreichbar – VM evtl. noch beim Booten/Cloud-Init${CL}"
+    echo -e "  ${BL}→ Ein paar Minuten warten, dann manuell per Console:${CL}"
+  fi
+  echo ""
+  echo -e "  ${BL}Installation manuell starten (in der VM Console):${CL}"
   echo -e "  ${YW}curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-proxmox/main/install.sh | sudo bash${CL}"
 fi
 
@@ -612,30 +701,42 @@ if [[ "$INSTALL_STARTED" == "true" ]]; then
   DONE=false
   for i in $(seq 1 120); do
     sleep 15
-    if ssh "${SSH_OPTS[@]}" "openbb@${VM_IP}" "test -f /var/log/openbb-install-done" 2>/dev/null; then
+    if ssh_cmd "openbb@${VM_IP}" "test -f /var/log/openbb-install-done" 2>/dev/null; then
       DONE=true
       break
     fi
-    LAST_LOG=$(ssh "${SSH_OPTS[@]}" "openbb@${VM_IP}" "tail -n 1 /var/log/openbb-install.log 2>/dev/null" 2>/dev/null)
+    LAST_LOG=$(ssh_cmd "openbb@${VM_IP}" "tail -n 1 /var/log/openbb-install.log 2>/dev/null" 2>/dev/null)
     printf "  ${YW}⏳ %2d Min – %s${CL}\033[K\r" "$((i/4))" "${LAST_LOG:-(warte)...}"
   done
   echo ""
 
   if [[ "$DONE" == "true" ]]; then
     msg_ok "Installation abgeschlossen!"
-    JUPYTER_TOKEN=$(ssh "${SSH_OPTS[@]}" "openbb@${VM_IP}" "cat /opt/openbb/jupyter_token 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
+    JUPYTER_TOKEN=$(ssh_cmd "openbb@${VM_IP}" "cat /opt/openbb/jupyter_token 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
   else
     msg_warn "Timeout beim Warten – Installation läuft evtl. noch im Hintergrund."
     echo -e "  ${BL}Status prüfen: ssh openbb@${VM_IP} 'sudo tail -20 /var/log/openbb-install.log'${CL}"
   fi
 fi
 
+# Passwort aus dem Speicher entfernen (nicht mehr benötigt)
+unset PASS PASS2 SSHPASS
+
 [[ -z "$JUPYTER_TOKEN" ]] && JUPYTER_TOKEN="(noch nicht verfügbar – siehe oben)"
+
+# Statusabhängige Titelzeile
+if [[ "$INSTALL_STARTED" == "true" && "${DONE:-false}" == "true" ]]; then
+  BANNER_TITLE="✅ OpenBB VM ERFOLGREICH ERSTELLT!"
+elif [[ "$INSTALL_STARTED" == "true" ]]; then
+  BANNER_TITLE="⏳ VM ERSTELLT – INSTALLATION LÄUFT NOCH"
+else
+  BANNER_TITLE="⚠ VM ERSTELLT – INSTALLATION MANUELL STARTEN"
+fi
 
 # ─── ABSCHLUSSMELDUNG ─────────────────────────────────────
 echo ""
 echo -e "${GN}${BOLD}╔══════════════════════════════════════════════════════╗${CL}"
-echo -e "${GN}${BOLD}║        ✅  OpenBB VM ERFOLGREICH ERSTELLT!           ║${CL}"
+printf "${GN}${BOLD}║${CL} %-52s ${GN}${BOLD}║${CL}\n" "$BANNER_TITLE"
 echo -e "${GN}${BOLD}╠══════════════════════════════════════════════════════╣${CL}"
 printf "${GN}${BOLD}║${CL}  %-52s ${GN}${BOLD}║${CL}\n" "VM-ID:    ${VMID}"
 printf "${GN}${BOLD}║${CL}  %-52s ${GN}${BOLD}║${CL}\n" "VM-Name:  ${HOSTNAME}"

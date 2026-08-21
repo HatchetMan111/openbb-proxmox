@@ -33,13 +33,17 @@ msg_ok "System aktualisiert"
 # ─── 2. SSH absichern ─────────────────────────────────────
 msg_info "SSH wird konfiguriert"
 mkdir -p /etc/ssh/sshd_config.d
-grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config.d/99-openbb.conf 2>/dev/null \
-  || echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/99-openbb.conf
-grep -q "^PermitRootLogin" /etc/ssh/sshd_config.d/99-openbb.conf 2>/dev/null \
-  || echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config.d/99-openbb.conf
-sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config 2>/dev/null || true
-sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/g' \
-  /etc/ssh/sshd_config.d/60-cloudimg-settings.conf 2>/dev/null || true
+# "00-" Präfix: sshd liest sshd_config.d lexikografisch, erster Treffer gewinnt
+cat > /etc/ssh/sshd_config.d/00-openbb.conf << 'SSHD'
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitRootLogin prohibit-password
+SSHD
+sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/g' /etc/ssh/sshd_config 2>/dev/null || true
+for f in /etc/ssh/sshd_config.d/*.conf; do
+  [[ "$f" == */00-openbb.conf ]] && continue
+  sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' "$f" 2>/dev/null || true
+done
 systemctl restart ssh
 msg_ok "SSH konfiguriert (Root-Login nur mit Key)"
 

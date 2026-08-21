@@ -160,6 +160,25 @@ Danach den Container neu starten: `cd /opt/openbb && docker compose restart`
 
 ---
 
+## 🛠️ Problembehebung
+
+**SSH-Verbindung schlägt fehl / Dienste nicht erreichbar?**
+- Der **erste Boot** kann einige Minuten dauern (Cloud-Init, Disk-Vergrößerung) – einfach warten
+- Installer zeigt an, ob Port 22 zu ist (VM bootet noch) oder offen (Auth-Thema)
+- Der SSH-Key wird **doppelt** installiert: direkt im Image *und* per Cloud-Init – sollte einer der Wege fehlschlagen, greift der andere
+- Notfall-Zugang: Proxmox Webinterface → VM → **Console** (User `openbb`, dein Passwort)
+- Installation manuell in der VM-Console starten:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-proxmox/main/install.sh | sudo bash
+  ```
+
+**Jupyter-Token vergessen?**
+```bash
+ssh openbb@VM-IP 'cat /opt/openbb/jupyter_token'
+```
+
+---
+
 ## Systemanforderungen
 
 - Proxmox VE 7.x oder 8.x
