@@ -702,7 +702,13 @@ echo "========================================"
 INSTALL_EOF
 
   # Script übertragen und im Hintergrund starten
-  scp_cmd "$REMOTE_SH_FILE" "openbb@${VM_IP}:/tmp/openbb-install.sh" 2>/dev/null
+  # WICHTIG: Die Log-Umleitung muss INNERHALB von sudo (bash -c) erfolgen!
+  # '> /var/log/...' als User openbb würde mit "Permission denied" sterben,
+  # da /var/log root gehört – genau das hat bisher den Start gekillt.
+  scp_cmd "$REMOTE_SH_FILE" "openbb@${VM_IP}:/tmp/openbb-install.sh"
+  if [[ $? -ne 0 ]]; then
+    msg_error "Script-Übertragung per SCP fehlgeschlagen!"
+  fi
 
   # sudo-Aufruf: mit NOPASSWD via 'sudo -n', sonst Passwort via 'sudo -S'
   if [[ "$SSHPASS_MODE" == "true" ]]; then
@@ -712,11 +718,19 @@ INSTALL_EOF
   fi
 
   ssh_cmd "openbb@${VM_IP}" \
-    "chmod +x /tmp/openbb-install.sh && ${SUDO_RUN} nohup /tmp/openbb-install.sh > /var/log/openbb-install.log 2>&1 < /dev/null & disown" \
+    "chmod +x /tmp/openbb-install.sh && ${SUDO_RUN} bash -c \"nohup /tmp/openbb-install.sh > /var/log/openbb-install.log 2>&1 < /dev/null & disown\"" \
     2>/dev/null
 
-  INSTALL_STARTED=true
-  msg_ok "OpenBB Installation gestartet!"
+  # Verifizieren dass das Script WIRKLICH läuft (Log muss existieren)
+  sleep 5
+  if ! ssh_cmd "openbb@${VM_IP}" "test -f /var/log/openbb-install.log" 2>/dev/null; then
+    msg_warn "Install-Script konnte nicht gestartet werden (kein Log vorhanden)!"
+    echo -e "  ${BL}Manuell starten (in der VM Console):${CL}"
+    echo -e "  ${YW}curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-proxmox/main/install.sh | sudo bash${CL}"
+  else
+    INSTALL_STARTED=true
+    msg_ok "OpenBB Installation läuft (Log verifiziert)!"
+  fi
 else
   msg_warn "SSH Verbindung fehlgeschlagen – manuelle Installation nötig"
   echo ""

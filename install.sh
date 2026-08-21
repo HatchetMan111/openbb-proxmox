@@ -222,12 +222,21 @@ systemctl daemon-reload
 systemctl enable openbb
 msg_ok "Autostart eingerichtet"
 
-# ─── 9. Container starten ─────────────────────────────────
-msg_info "Container werden heruntergeladen & gestartet (kann einige Min dauern)"
+# ─── 9. Container starten (gestaffelt) ────────────────────
+msg_info "Container werden gestartet (mehrere GB Download – Portainer zuerst)"
 cd "$OPENBB_DIR"
-docker compose pull openbb portainer || true
-docker compose up -d --build
-msg_ok "Alle Container gestartet"
+docker compose up -d portainer
+msg_ok "Portainer gestartet: http://$(hostname -I | awk '{print $1}'):9000"
+docker compose pull openbb || true
+docker compose up -d openbb || true
+msg_ok "OpenBB gestartet"
+msg_info "Jupyter-Image wird gebaut (dauert am längsten)"
+if docker compose build jupyterlab; then
+  docker compose up -d jupyterlab
+  msg_ok "JupyterLab gestartet"
+else
+  msg_error "Jupyter-Build fehlgeschlagen – Log siehe oben"
+fi
 
 # ─── Abschluss ────────────────────────────────────────────
 echo ""
