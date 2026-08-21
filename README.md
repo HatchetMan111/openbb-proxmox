@@ -21,7 +21,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-pro
 |---|---|---|
 | **JupyterLab** | 8888 | Haupt-Interface für OpenBB Analysen |
 | **OpenBB API** | 6900 | REST API + Swagger Dokumentation |
-| **Portainer** | 9000 | Docker Web-GUI |
+| **Portainer** | 9000 (HTTP) / 9443 (HTTPS) | Docker Web-GUI |
 
 **Kostenlose Datenquellen:**
 - 📈 Yahoo Finance – Aktien, ETFs, DAX, Crypto
@@ -39,7 +39,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-pro
 
 ### 2. Script ausführen
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/DEIN_GITHUB/openbb-proxmox/main/setup.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/HatchetMan111/openbb-proxmox/main/setup.sh)"
 ```
 
 ### 3. Dem Installer folgen
@@ -49,14 +49,26 @@ Das Script führt dich durch alles mit einfachen Dialogen:
 - Storage wählen
 - Fertig ✔
 
-### 4. Warten (~5 Minuten)
-Die VM bootet und installiert OpenBB automatisch.
+### 4. Warten (~10 Minuten)
+Die VM bootet und installiert alles automatisch. Am Ende zeigt das Script
+die **VM-IP**, alle Zugangs-URLs und den Jupyter-Token an.
 
 ### 5. JupyterLab öffnen
 ```
 http://VM-IP:8888
-Token: openbb_local
+Token: wird dir am Ende angezeigt
+       (dauerhaft gespeichert in der VM unter /opt/openbb/jupyter_token)
 ```
+
+---
+
+## 🔄 Nach einem Neustart
+
+Es sind **keine Zusatzschritte notwendig**:
+
+- Die VM startet automatisch (`onboot`)
+- Alle Container starten automatisch (systemd + Docker restart-policy)
+- OpenBB ist im Jupyter-Image fest eingebaut → **sofort bereit**, keine erneute Installation
 
 ---
 
@@ -75,7 +87,7 @@ sudo tail -f /var/log/openbb-install.log
 ## Erstes OpenBB Notebook ausführen
 
 1. JupyterLab öffnen: `http://VM-IP:8888`
-2. Token eingeben: `openbb_local`
+2. Token eingeben (siehe Installer-Ausgabe bzw. `/opt/openbb/jupyter_token`)
 3. Datei `Schnellstart.py` öffnen
 4. Kernel: **Python 3** wählen
 5. ▶ Run All klicken
@@ -105,11 +117,14 @@ docker logs openbb -f
 # Logs von JupyterLab
 docker logs openbb-jupyter -f
 
+# Jupyter-Token anzeigen
+cat /opt/openbb/jupyter_token
+
 # Alle Container neustarten
 cd /opt/openbb && docker compose restart
 
 # Update auf neueste Version
-cd /opt/openbb && docker compose pull && docker compose up -d
+cd /opt/openbb && docker compose pull && docker compose up -d --build
 ```
 
 ---
@@ -124,7 +139,24 @@ Mehr Daten mit kostenlosen Registrierungen:
 | **Alpha Vantage** | alphavantage.co | 25 Calls/Tag gratis |
 | **CoinGecko** | coingecko.com/en/api | Crypto Daten |
 
-Keys eintragen in: `/root/.openbb_platform/user_settings.json`
+Keys eintragen – je nachdem wo du sie nutzt:
+- **JupyterLab (empfohlen):** in der VM unter `/opt/openbb/jupyter-home/user_settings.json`
+  ```json
+  { "credentials": { "fred": { "api_key": "DEIN_KEY" } } }
+  ```
+- **OpenBB API Container:** `/root/.openbb_platform/user_settings.json`
+
+Danach den Container neu starten: `cd /opt/openbb && docker compose restart`
+
+---
+
+## 🔒 Sicherheitshinweise
+
+- **Root-SSH-Login** ist nur per SSH-Key möglich (`prohibit-password`)
+- **Jupyter-Token** wird bei jeder Installation zufällig generiert und dauerhaft gespeichert
+- Das Setup richtet nur für die Automatik-Installation temporär passwortloses Sudo ein und **entfernt es danach automatisch**
+- ⚠️ Alle Dienste sind im LAN ohne HTTPS erreichbar – für den Betrieb außerhalb des eigenen Netzwerks einen Reverse Proxy mit TLS vorschalten
+- ⚠️ Portainer beim ersten Aufruf sofort absichern (Admin-Account erstellen, innerhalb weniger Minuten!)
 
 ---
 
