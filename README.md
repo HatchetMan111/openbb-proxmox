@@ -49,9 +49,21 @@ Das Script führt dich durch alles mit einfachen Dialogen:
 - Storage wählen
 - Fertig ✔
 
-### 4. Warten (~10 Minuten)
-Die VM bootet und installiert alles automatisch. Am Ende zeigt das Script
-die **VM-IP**, alle Zugangs-URLs und den Jupyter-Token an.
+### 4. Warten (15–60 Min je nach Internetleitung)
+Die VM bootet und installiert alles automatisch. Dabei werden mehrere GB
+Docker-Images geladen (OpenBB ~1-2 GB, Jupyter ~3 GB) – das dauert.
+
+Der Installer zeigt **live an, in welcher Phase** er ist:
+
+| Phase | Erreichbar |
+|---|---|
+| Portainer wird gestartet | `http://VM-IP:9000` nach ~3–5 Min |
+| OpenBB Image wird geladen | – |
+| Jupyter-Image wird gebaut (längster Schritt) | – |
+| Fertig | Alle Dienste + IP + Token werden angezeigt |
+
+Am Ende zeigt das Script die **VM-IP**, alle Zugangs-URLs, den Jupyter-Token
+und eine Erreichbarkeitsprüfung aller Ports an.
 
 ### 5. JupyterLab öffnen
 ```

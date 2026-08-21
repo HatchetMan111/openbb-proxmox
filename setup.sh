@@ -366,6 +366,7 @@ INSTALL_STARTED=false
 msg_info "Verbinde mit VM via SSH um OpenBB zu installieren"
 
 SSH_OPTS=(-i "$SSH_KEY_PATH"
+  -o IdentitiesOnly=yes
   -o StrictHostKeyChecking=accept-new
   -o ConnectTimeout=5
   -o BatchMode=yes
@@ -429,6 +430,12 @@ if [[ "$SSH_OK" != "true" ]] && port_open; then
     SSH_OK=true
     SSHPASS_MODE=true
     msg_ok "Passwort-Login erfolgreich!"
+  else
+    # Verbose-Diagnose: warum scheitert die Authentifizierung?
+    DIAG=$(ssh -vv -i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o BatchMode=yes \
+      -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+      "openbb@${VM_IP}" "echo ok" 2>&1 | grep -Ei "permission denied|authentications that can continue|no mutual|server refused|denied" | tail -2)
+    echo -e "  ${YW}Auth-Diagnose: ${DIAG:-keine Details}${CL}"
   fi
 fi
 
@@ -616,12 +623,31 @@ systemctl daemon-reload
 systemctl enable openbb
 echo "  → Docker Compose OK"
 
-# Container starten (baut Jupyter-Image einmalig mit)
-echo "[7/7] Container starten & Images laden (dauert 5-10 Min)..."
+# Container starten – GESTAFFELT:
+# 1. Portainer sofort (klein, nach ~3 Min erreichbar)
+# 2. OpenBB Image laden (~1-2 GB) + starten
+# 3. Jupyter-Image bauen (am längsten: pip install openbb)
+# Jede Stufe schreibt einen Marker → der Host-Installer zeigt Live-Fortschritt
+echo "[7/7] Container starten (gestaffelt, mehrere GB Download)..."
 cd /opt/openbb || exit 1
-docker compose pull openbb portainer 2>&1 | tail -2 || true
-docker compose up -d --build 2>&1 | tail -5
-echo "  → Container gestartet"
+
+echo "portainer" > /var/log/openbb-install-stage
+docker compose up -d portainer >> "$LOG" 2>&1
+echo "  → Portainer gestartet"
+
+echo "pull-openbb" > /var/log/openbb-install-stage
+docker compose pull openbb >> "$LOG" 2>&1 || true
+docker compose up -d openbb >> "$LOG" 2>&1 || true
+echo "openbb" > /var/log/openbb-install-stage
+echo "  → OpenBB gestartet"
+
+echo "build-jupyter" > /var/log/openbb-install-stage
+echo "  → Jupyter-Image wird gebaut (dauert am laengsten)"
+if docker compose build jupyterlab >> "$LOG" 2>&1; then
+  docker compose up -d jupyterlab >> "$LOG" 2>&1 || true
+else
+  echo "ERROR: Jupyter-Image Build fehlgeschlagen – Details im Log" >> "$LOG"
+fi
 
 # Beispiel-Notebook
 cat > /opt/openbb/notebooks/Schnellstart.py << 'NB'
@@ -646,10 +672,24 @@ print(obb.equity.price.historical("SAP.DE", provider="yfinance").to_df().tail(5)
 # print(obb.economy.fred_series("CPIAUCSL", provider="fred").to_df().tail(5))
 NB
 
+# Status für den Host-Installer erfassen (lesbar ohne sudo)
+docker ps --format '{{.Names}} | {{.Status}}' > /var/log/openbb-container-status 2>&1
+chmod 644 /var/log/openbb-container-status
+
+RUNNING=$(docker ps --format '{{.Names}}' 2>/dev/null)
+if echo "$RUNNING" | grep -qx 'openbb-jupyter' && echo "$RUNNING" | grep -qx 'openbb' && echo "$RUNNING" | grep -qx 'portainer'; then
+  echo "OK" > /var/log/openbb-install-status
+else
+  echo "FEHLER: Nicht alle Container laufen – siehe /var/log/openbb-container-status" > /var/log/openbb-install-status
+fi
+chmod 644 /var/log/openbb-install-status
+
+echo "done" > /var/log/openbb-install-stage
+
 # Sicherheit: Temporäres NOPASSWD-Sudo wieder entfernen
 # (User kann weiterhin sudo nutzen – dann aber mit Passwort)
 rm -f /etc/sudoers.d/openbb
-sed -i '/^openbb /d;/\bopenbb\b/d' /etc/sudoers.d/90-cloud-init-users 2>/dev/null || true
+sed -i '/openbb/d' /etc/sudoers.d/90-cloud-init-users 2>/dev/null || true
 
 touch /var/log/openbb-install-done
 
@@ -696,26 +736,56 @@ fi
 
 # ─── Auf Abschluss der Installation warten ────────────────
 JUPYTER_TOKEN=""
+INSTALL_STATUS=""
 if [[ "$INSTALL_STARTED" == "true" ]]; then
-  msg_info "Warte auf Abschluss der Installation (bis zu 30 Min – Fortschritt siehe unten)"
+  msg_info "Warte auf Abschluss (bis zu 60 Min – mehrere GB Download, Live-Status unten)"
   DONE=false
-  for i in $(seq 1 120); do
+  STAGE_TEXT="verbinde..."
+  for i in $(seq 1 240); do
     sleep 15
     if ssh_cmd "openbb@${VM_IP}" "test -f /var/log/openbb-install-done" 2>/dev/null; then
       DONE=true
       break
     fi
-    LAST_LOG=$(ssh_cmd "openbb@${VM_IP}" "tail -n 1 /var/log/openbb-install.log 2>/dev/null" 2>/dev/null)
-    printf "  ${YW}⏳ %2d Min – %s${CL}\033[K\r" "$((i/4))" "${LAST_LOG:-(warte)...}"
+    STAGE=$(ssh_cmd "openbb@${VM_IP}" "cat /var/log/openbb-install-stage 2>/dev/null" 2>/dev/null)
+    case "$STAGE" in
+      portainer)     STAGE_TEXT="Portainer wird gestartet (nach ~3 Min erreichbar)" ;;
+      "pull-openbb") STAGE_TEXT="OpenBB Image wird geladen (~1-2 GB)..." ;;
+      openbb)        STAGE_TEXT="OpenBB Container startet..." ;;
+      build-jupyter) STAGE_TEXT="Jupyter-Image wird gebaut – laengster Schritt (~10-25 Min)" ;;
+      done)          STAGE_TEXT="fast fertig..." ;;
+      *)             STAGE_TEXT="(warte auf VM...)" ;;
+    esac
+    printf "  ${YW}⏳ %2d Min – %s${CL}\033[K\r" "$((i/4))" "$STAGE_TEXT"
   done
   echo ""
 
+  INSTALL_STATUS=$(ssh_cmd "openbb@${VM_IP}" "cat /var/log/openbb-install-status 2>/dev/null" 2>/dev/null)
+  CONTAINER_STATUS=$(ssh_cmd "openbb@${VM_IP}" "cat /var/log/openbb-container-status 2>/dev/null" 2>/dev/null)
+
   if [[ "$DONE" == "true" ]]; then
-    msg_ok "Installation abgeschlossen!"
+    msg_ok "Installation abgeschlossen! (${INSTALL_STATUS:-Status unbekannt})"
     JUPYTER_TOKEN=$(ssh_cmd "openbb@${VM_IP}" "cat /opt/openbb/jupyter_token 2>/dev/null" 2>/dev/null | tr -d '[:space:]')
   else
-    msg_warn "Timeout beim Warten – Installation läuft evtl. noch im Hintergrund."
-    echo -e "  ${BL}Status prüfen: ssh openbb@${VM_IP} 'sudo tail -20 /var/log/openbb-install.log'${CL}"
+    msg_warn "Timeout nach 60 Min – Installation läuft evtl. noch im Hintergrund."
+    echo -e "  ${BL}Letzte Stufe: ${STAGE_TEXT}${CL}"
+    echo -e "  ${BL}Live mitverfolgen: ssh openbb@${VM_IP} 'tail -f /var/log/openbb-install.log'${CL}"
+  fi
+
+  # Erreichbarkeit der Dienste direkt vom Proxmox-Host prüfen
+  echo ""
+  echo -e "  ${BOLD}Erreichbarkeit (von diesem Host geprüft):${CL}"
+  for p in 8888 9000 6900; do
+    if timeout 3 bash -c "</dev/tcp/${VM_IP}/${p}" 2>/dev/null; then
+      echo -e "   ${CM} Port ${p}: erreichbar"
+    else
+      echo -e "   ${CROSS} Port ${p}: noch nicht erreichbar"
+    fi
+  done
+  if [[ -n "$CONTAINER_STATUS" ]]; then
+    echo ""
+    echo -e "  ${BOLD}Container in der VM:${CL}"
+    echo "$CONTAINER_STATUS" | sed 's/^/    /'
   fi
 fi
 
